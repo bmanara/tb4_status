@@ -18,7 +18,7 @@ def generate_launch_description():
                 Node(
                     package='tb4_status',
                     executable='tb4_status_node',
-                    name='tb4_status_node',
+                    name='turtlebot_status_node',
                     output='screen',
                     parameters=[{'robot_name': name}],
                 )
