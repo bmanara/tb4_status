@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'tb4_status_node = tb4_status.tb4_status_node:main',
+            'tb4_api_node = tb4_status.tb4_api_node:main',
         ],
     },    
 )
