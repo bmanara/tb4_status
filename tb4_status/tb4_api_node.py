@@ -3,13 +3,23 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
+from std_msgs.msg import Header
 from sensor_msgs.msg import BatteryState
 from irobot_create_msgs.action import Dock, Undock
+from geometry_msgs.msg import PoseWithCovarianceStamped
 
+import math
 import threading
 from fastapi import FastAPI
 import uvicorn
 from pydantic import BaseModel
+
+
+# Constants
+DEFAULT_INITIAL_POSE_COVARIANCE = [0.0] * 36
+DEFAULT_INITIAL_POSE_COVARIANCE[0] = 0.25
+DEFAULT_INITIAL_POSE_COVARIANCE[7] = 0.25
+DEFAULT_INITIAL_POSE_COVARIANCE[35] = 0.06853891945200942
 
 
 class TB4ApiNode(Node):
@@ -25,6 +35,12 @@ class TB4ApiNode(Node):
         super().__init__('tb4_api_node')
         self._dock_client = ActionClient(self, Dock, 'dock')
         self._undock_client = ActionClient(self, Undock, 'undock')
+
+        self.initial_pose_publisher = self.create_publisher(
+            PoseWithCovarianceStamped,
+            'initialpose',
+            10
+        )
 
         self.current_battery_state = None
         self.battery_state_subscriber = self.create_subscription(
@@ -110,11 +126,29 @@ class TB4ApiNode(Node):
         else:
             self.get_logger().info(f"Undock action completed with result: {result}")
 
-    def set_initial_pose(self, pose: tuple = (0.0, 0.0, 0.0)):
+    def set_initial_pose(self, position: tuple = (0.0, 0.0, 0.0), orientation: tuple = (0.0, 0.0, 0.0, 1.0)):
         """
         Sets the initial pose of the TurtleBot 4.
         """
-        return NotImplementedError("Setting initial pose is not implemented yet.")
+        pose_msg = PoseWithCovarianceStamped()
+        pose_msg.header = Header()
+        pose_msg.header.stamp = self.get_clock().now().to_msg()
+        pose_msg.header.frame_id = 'map'
+
+        pose_msg.pose.pose.position.x = position[0]
+        pose_msg.pose.pose.position.y = position[1]
+        pose_msg.pose.pose.position.z = position[2]
+
+        pose_msg.pose.pose.orientation.x = orientation[0]
+        pose_msg.pose.pose.orientation.y = orientation[1]
+        pose_msg.pose.pose.orientation.z = orientation[2]
+        pose_msg.pose.pose.orientation.w = orientation[3]
+
+        pose_msg.pose.covariance = DEFAULT_INITIAL_POSE_COVARIANCE
+
+        self.initial_pose_publisher.publish(pose_msg)
+
+        return True
 
     def send_trajectory(self, trajectory: list):
         """
@@ -132,7 +166,11 @@ class TB4ApiNode(Node):
         return NotImplementedError("Trajectory message creation is not implemented yet.")
 
 
-class TrajectoryCommand(BaseModel):
+class PoseModel(BaseModel):
+    position: tuple
+    orientation: tuple
+
+class TrajectoryModel(BaseModel):
     trajectory: list
 
 app = FastAPI()
@@ -161,13 +199,15 @@ async def undock():
     return {"success": success}
 
 @app.post('/initialize')
-async def initialize():
-    success = tb4_api_node.set_initial_pose()
+async def initialize(pose_model: PoseModel):
+    position = pose_model.position
+    orientation = pose_model.orientation
+    success = tb4_api_node.set_initial_pose(position, orientation)
     return {"success": success}
 
 @app.post('/trajectory')
-async def trajectory(TrajectoryCommand: TrajectoryCommand):
-    trajectory = TrajectoryCommand.trajectory
+async def trajectory(trajectory_model: TrajectoryModel):
+    trajectory = trajectory_model.trajectory
     tb4_api_node.send_trajectory(trajectory)
     return {"message": "Trajectory command received", "trajectory": trajectory}
 
