@@ -9,13 +9,17 @@ from irobot_create_msgs.action import Dock, Undock
 import threading
 from fastapi import FastAPI
 import uvicorn
+from pydantic import BaseModel
 
 
 class TB4ApiNode(Node):
     """
     TurtleBot 4 API Node (Provides REST API for controlling TurtleBot 4)
     This node provides a REST API to control the TurtleBot 4 robot.
-    It allows actions such as docking, undocking, and also provides status information.
+    Provided Functionality:
+    - Docking and undocking the robot
+    - Getting robot status (battery state, TODO: other states)
+    - Receiving and translating trajectory commands (TODO)
     """
     def __init__(self):
         super().__init__('tb4_api_node')
@@ -106,6 +110,30 @@ class TB4ApiNode(Node):
         else:
             self.get_logger().info(f"Undock action completed with result: {result}")
 
+    def set_initial_pose(self, pose: tuple = (0.0, 0.0, 0.0)):
+        """
+        Sets the initial pose of the TurtleBot 4.
+        """
+        return NotImplementedError("Setting initial pose is not implemented yet.")
+
+    def send_trajectory(self, trajectory: list):
+        """
+        Handles translation and sending a trajectory command to the TurtleBot 4.
+        """
+        if trajectory is None or len(trajectory) == 0:
+            self.get_logger().error("Received empty trajectory command.")
+            return
+
+        nav2_trajectory_msg = self.__create_trajectory_message(trajectory)
+        
+        return NotImplementedError("Trajectory command handling is not implemented yet.")
+
+    def __create_trajectory_message(self, trajectory: list):
+        return NotImplementedError("Trajectory message creation is not implemented yet.")
+
+
+class TrajectoryCommand(BaseModel):
+    trajectory: list
 
 app = FastAPI()
 
@@ -121,7 +149,7 @@ async def status():
     return {"status": status}
 
 
-# Not working rn, will crash the app 
+# API Endpoints
 @app.post('/dock')
 async def dock():
     success = tb4_api_node.send_dock_goal()
@@ -131,6 +159,17 @@ async def dock():
 async def undock():
     success = tb4_api_node.send_undock_goal()
     return {"success": success}
+
+@app.post('/initialize')
+async def initialize():
+    success = tb4_api_node.set_initial_pose()
+    return {"success": success}
+
+@app.post('/trajectory')
+async def trajectory(TrajectoryCommand: TrajectoryCommand):
+    trajectory = TrajectoryCommand.trajectory
+    tb4_api_node.send_trajectory(trajectory)
+    return {"message": "Trajectory command received", "trajectory": trajectory}
 
 
 def main(args=None):
