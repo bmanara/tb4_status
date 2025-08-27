@@ -4,11 +4,12 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
 from std_msgs.msg import Header
+from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped
 from sensor_msgs.msg import BatteryState
-from irobot_create_msgs.action import Dock, Undock
-from geometry_msgs.msg import PoseWithCovarianceStamped
 
-import math
+from nav2_msgs.action import NavigateToPose, NavigateThroughPoses
+from irobot_create_msgs.action import Dock, Undock
+
 import threading
 from fastapi import FastAPI
 import uvicorn
@@ -20,6 +21,30 @@ DEFAULT_INITIAL_POSE_COVARIANCE = [0.0] * 36
 DEFAULT_INITIAL_POSE_COVARIANCE[0] = 0.25
 DEFAULT_INITIAL_POSE_COVARIANCE[7] = 0.25
 DEFAULT_INITIAL_POSE_COVARIANCE[35] = 0.06853891945200942
+
+DUMMY_POINTS = [
+    (-12.0, -2.0, 0.0),
+    (-11.0, -2.0, 0.0),
+    (-10.0, -2.0, 0.0),
+    (-9.0, -2.0, 0.0),
+    (-8.0, -2.0, 0.0),
+    (-7.0, -2.0, 0.0),
+    (-6.0, -2.0, 0.0),
+    (-12.0, -1.0, 0.0),
+    (-11.0, -1.0, 0.0),
+    (-10.0, -1.0, 0.0),
+    (-9.0, -1.0, 0.0),
+    (-8.0, -1.0, 0.0),
+    (-7.0, -1.0, 0.0),
+    (-6.0, -1.0, 0.0),
+    (-12.0, 0.0, 0.0),
+    (-11.0, 0.0, 0.0),
+    (-10.0, 0.0, 0.0),
+    (-9.0, 0.0, 0.0),
+    (-8.0, 0.0, 0.0),
+    (-7.0, 0.0, 0.0),
+    (-6.0, 0.0, 0.0),
+]
 
 
 class TB4ApiNode(Node):
@@ -49,6 +74,9 @@ class TB4ApiNode(Node):
             self.battery_state_callback,
             qos_profile_sensor_data
         )
+
+        self._navigate_to_pose_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._navigate_through_poses_client = ActionClient(self, NavigateThroughPoses, 'navigate_through_poses')
 
     def battery_state_callback(self, msg: BatteryState):
         """
@@ -150,23 +178,130 @@ class TB4ApiNode(Node):
 
         return True
 
-    def send_trajectory(self, trajectory: list):
+    def send_goal(self, position: tuple, orientation: tuple):
         """
-        Handles translation and sending a trajectory command to the TurtleBot 4.
+        Handles translation and sending a goal command to the TurtleBot 4.
         """
-        if trajectory is None or len(trajectory) == 0:
-            self.get_logger().error("Received empty trajectory command.")
+        if position is None or len(position) != 2:
+            self.get_logger().error("Invalid position provided. Must be a tuple of (x, y).")
+            return
+        
+        if orientation is None or len(orientation) != 4:
+            self.get_logger().error("Invalid orientation provided. Must be a tuple of (x, y, z, w).")
             return
 
-        nav2_trajectory_msg = self.__create_trajectory_message(trajectory)
-        
-        return NotImplementedError("Trajectory command handling is not implemented yet.")
+        nav2_goal_msg = NavigateToPose.Goal()
+
+        nav2_goal_msg.pose.header = Header()
+        nav2_goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        nav2_goal_msg.pose.header.frame_id = 'map'
+
+        nav2_goal_msg.pose.pose.position.x = position[0]
+        nav2_goal_msg.pose.pose.position.y = position[1]
+        nav2_goal_msg.pose.pose.position.z = 0.0
+
+        nav2_goal_msg.pose.pose.orientation.x = orientation[0]
+        nav2_goal_msg.pose.pose.orientation.y = orientation[1]
+        nav2_goal_msg.pose.pose.orientation.z = orientation[2]
+        nav2_goal_msg.pose.pose.orientation.w = orientation[3]
+
+        self._navigate_to_pose_client.wait_for_server()
+
+        self.get_logger().info("Sending goal command to TurtleBot 4...")
+
+        future = self._navigate_to_pose_client.send_goal_async(nav2_goal_msg)
+        future.add_done_callback(self.__goal_response_callback)
+
+    def __goal_response_callback(self, future):
+        """
+        Private callback for the goal response.
+        """
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error("Goal was rejected.")
+            return
+
+        self.get_logger().info("Goal accepted, waiting for result...")
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.__goal_result_callback)
+
+    def __goal_result_callback(self, future):
+        """
+        Private callback for the goal result.
+        """
+        result = future.result().result
+        if result is None:
+            self.get_logger().error("Goal action failed.")
+        else:
+            self.get_logger().info(f"Goal action completed with result: {result}")
+
+    def send_trajectory(self, trajectory: list):
+        trajectory_msg = self.__create_trajectory_message(trajectory)
+
+
+    def __trajectory_response_callback(self, future):
+        return NotImplementedError("Response callback creation not implemented yet.")
+    
+    def __trajectory_result_callback(self, future):
+        return NotImplementedError("Result callback creation not implemented yet.")
 
     def __create_trajectory_message(self, trajectory: list):
-        return NotImplementedError("Trajectory message creation is not implemented yet.")
+        # For now, send a dummy trajectory message
+        # TODO: This should be replaced with actual trajectory message creation logic
+        poses = [self.__create_pose_message(traj) for traj in trajectory]
+        trajectory_msg = NavigateThroughPoses.Goal()
+        trajectory_msg.poses = poses
+        
+        self._navigate_through_poses_client.wait_for_server()
+        self.get_logger().info("Sending trajectory command to TurtleBot 4...")
 
+        future = self._navigate_through_poses_client.send_goal_async(trajectory_msg)
+        future.add_done_callback(self.__trajectory_response_callback)
+
+    def __trajectory_response_callback(self, future):
+        """
+        Private callback for the trajectory response.
+        """
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error("Trajectory was rejected.")
+            return
+
+        self.get_logger().info("Trajectory accepted, waiting for result...")
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.__trajectory_result_callback)
+
+    def __goal_result_callback(self, future):
+        """
+        Private callback for the trajectory result.
+        """
+        result = future.result().result
+        if result is None:
+            self.get_logger().error("Trajectory action failed.")
+        else:
+            self.get_logger().info(f"Trajectory action completed with result: {result}")
+
+    def __create_pose_message(self, traj: int):
+        point = DUMMY_POINTS[traj]
+
+        pose_msg = PoseStamped()
+        pose_msg.header.stamp = self.get_clock().now().to_msg()
+        pose_msg.header.frame_id = 'map'
+        pose_msg.pose.position.x = point[0]
+        pose_msg.pose.position.y = point[1]
+        pose_msg.pose.position.z = 0.0
+        pose_msg.pose.orientation.x = 0.0
+        pose_msg.pose.orientation.y = 0.0
+        pose_msg.pose.orientation.z = 0.0
+        pose_msg.pose.orientation.w = 1.0
+
+        return pose_msg
 
 class PoseModel(BaseModel):
+    position: tuple
+    orientation: tuple
+
+class GoalModel(BaseModel):
     position: tuple
     orientation: tuple
 
@@ -175,6 +310,7 @@ class TrajectoryModel(BaseModel):
 
 app = FastAPI()
 
+# API Endpoints
 @app.get('/status')
 async def status():
     """
@@ -186,8 +322,6 @@ async def status():
     status['battery_percentage'] = tb4_api_node.current_battery_state.percentage * 100 if tb4_api_node.current_battery_state else None
     return {"status": status}
 
-
-# API Endpoints
 @app.post('/dock')
 async def dock():
     success = tb4_api_node.send_dock_goal()
@@ -205,11 +339,18 @@ async def initialize(pose_model: PoseModel):
     success = tb4_api_node.set_initial_pose(position, orientation)
     return {"success": success}
 
+@app.post('/goal')
+async def goal(goal_model: GoalModel):
+    position = goal_model.position
+    orientation = goal_model.orientation
+    tb4_api_node.send_goal(position, orientation)
+    return {"message": "Goal command received", "goal": goal_model}
+
 @app.post('/trajectory')
 async def trajectory(trajectory_model: TrajectoryModel):
     trajectory = trajectory_model.trajectory
     tb4_api_node.send_trajectory(trajectory)
-    return {"message": "Trajectory command received", "trajectory": trajectory}
+    return {"message": "Trajectory command received", "trajectory": trajectory_model}
 
 
 def main(args=None):
