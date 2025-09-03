@@ -6,10 +6,12 @@ from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Header
 from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped
 from sensor_msgs.msg import BatteryState
+from tb4_status_interface.msg import StatusUpdate
 
 from nav2_msgs.action import NavigateToPose, NavigateThroughPoses
 from irobot_create_msgs.action import Dock, Undock
 
+import json
 import threading
 from fastapi import FastAPI
 import uvicorn
@@ -22,29 +24,29 @@ DEFAULT_INITIAL_POSE_COVARIANCE[0] = 0.25
 DEFAULT_INITIAL_POSE_COVARIANCE[7] = 0.25
 DEFAULT_INITIAL_POSE_COVARIANCE[35] = 0.06853891945200942
 
-DUMMY_POINTS = [
-    (-12.0, -2.0, 0.0),
-    (-11.0, -2.0, 0.0),
-    (-10.0, -2.0, 0.0),
-    (-9.0, -2.0, 0.0),
-    (-8.0, -2.0, 0.0),
-    (-7.0, -2.0, 0.0),
-    (-6.0, -2.0, 0.0),
-    (-12.0, -1.0, 0.0),
-    (-11.0, -1.0, 0.0),
-    (-10.0, -1.0, 0.0),
-    (-9.0, -1.0, 0.0),
-    (-8.0, -1.0, 0.0),
-    (-7.0, -1.0, 0.0),
-    (-6.0, -1.0, 0.0),
-    (-12.0, 0.0, 0.0),
-    (-11.0, 0.0, 0.0),
-    (-10.0, 0.0, 0.0),
-    (-9.0, 0.0, 0.0),
-    (-8.0, 0.0, 0.0),
-    (-7.0, 0.0, 0.0),
-    (-6.0, 0.0, 0.0),
-]
+# DUMMY_POINTS = [
+#     (-12.0, -2.0, 0.0),
+#     (-11.0, -2.0, 0.0),
+#     (-10.0, -2.0, 0.0),
+#     (-9.0, -2.0, 0.0),
+#     (-8.0, -2.0, 0.0),
+#     (-7.0, -2.0, 0.0),
+#     (-6.0, -2.0, 0.0),
+#     (-12.0, -1.0, 0.0),
+#     (-11.0, -1.0, 0.0),
+#     (-10.0, -1.0, 0.0),
+#     (-9.0, -1.0, 0.0),
+#     (-8.0, -1.0, 0.0),
+#     (-7.0, -1.0, 0.0),
+#     (-6.0, -1.0, 0.0),
+#     (-12.0, 0.0, 0.0),
+#     (-11.0, 0.0, 0.0),
+#     (-10.0, 0.0, 0.0),
+#     (-9.0, 0.0, 0.0),
+#     (-8.0, 0.0, 0.0),
+#     (-7.0, 0.0, 0.0),
+#     (-6.0, 0.0, 0.0),
+# ]
 
 
 class TB4ApiNode(Node):
@@ -58,12 +60,19 @@ class TB4ApiNode(Node):
     """
     def __init__(self):
         super().__init__('tb4_api_node')
+        self.map_landmarks = None
         self._dock_client = ActionClient(self, Dock, 'dock')
         self._undock_client = ActionClient(self, Undock, 'undock')
 
         self.initial_pose_publisher = self.create_publisher(
             PoseWithCovarianceStamped,
             'initialpose',
+            10
+        )
+
+        self.status_update_publisher = self.create_publisher(
+            StatusUpdate,
+            'status_update',
             10
         )
 
@@ -77,6 +86,9 @@ class TB4ApiNode(Node):
 
         self._navigate_to_pose_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._navigate_through_poses_client = ActionClient(self, NavigateThroughPoses, 'navigate_through_poses')
+
+        self.map_landmarks = self.__read_map_from_json()
+        self.get_logger().info(f"Map landmarks loaded: {self.map_landmarks}")
 
     def battery_state_callback(self, msg: BatteryState):
         """
@@ -238,12 +250,28 @@ class TB4ApiNode(Node):
     def send_trajectory(self, trajectory: list):
         trajectory_msg = self.__create_trajectory_message(trajectory)
 
-
     def __trajectory_response_callback(self, future):
-        return NotImplementedError("Response callback creation not implemented yet.")
-    
+        """
+        Private callback for the trajectory response.
+        """
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error("Trajectory was rejected.")
+            return
+
+        self.get_logger().info("Trajectory accepted, waiting for result...")
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.__trajectory_result_callback)
+
     def __trajectory_result_callback(self, future):
-        return NotImplementedError("Result callback creation not implemented yet.")
+        """
+        Private callback for the trajectory result.
+        """
+        result = future.result().result
+        if result is None:
+            self.get_logger().error("Trajectory action failed.")
+        else:
+            self.get_logger().info(f"Trajectory action completed with result: {result}")
 
     def __create_trajectory_message(self, trajectory: list):
         # For now, send a dummy trajectory message
@@ -254,6 +282,11 @@ class TB4ApiNode(Node):
         
         self._navigate_through_poses_client.wait_for_server()
         self.get_logger().info("Sending trajectory command to TurtleBot 4...")
+
+        # TODO: Probably best NOT to update status of turtlebot here...
+        status_msg = StatusUpdate()
+        status_msg.status = 1
+        self.status_update_publisher.publish(status_msg)
 
         future = self._navigate_through_poses_client.send_goal_async(trajectory_msg)
         future.add_done_callback(self.__trajectory_response_callback)
@@ -281,14 +314,15 @@ class TB4ApiNode(Node):
         else:
             self.get_logger().info(f"Trajectory action completed with result: {result}")
 
-    def __create_pose_message(self, traj: int):
-        point = DUMMY_POINTS[traj]
+    def __create_pose_message(self, p: int):
+        point = self.map_landmarks[p]
+        self.get_logger().debug(f"Creating pose message for landmark {p} at point {point}")
 
         pose_msg = PoseStamped()
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.header.frame_id = 'map'
-        pose_msg.pose.position.x = point[0]
-        pose_msg.pose.position.y = point[1]
+        pose_msg.pose.position.x = point[0] - 3.9
+        pose_msg.pose.position.y = point[1] - 0.9
         pose_msg.pose.position.z = 0.0
         pose_msg.pose.orientation.x = 0.0
         pose_msg.pose.orientation.y = 0.0
@@ -296,6 +330,18 @@ class TB4ApiNode(Node):
         pose_msg.pose.orientation.w = 1.0
 
         return pose_msg
+
+    def __read_map_from_json(self):
+        """
+        Note that this method forces user to run program in turtlebot4_ws.
+        Though, it is not the only thing forcing the above requirement...
+        """
+        file_path = '/home/ubuntu/turtlebot4_ws/level5_arena_v3-1.json'
+        with open(file_path, 'r') as f:
+            map_data = json.load(f)
+            map_landmarks = {vertex["user_uid"]: (vertex["robot_pose_x"], vertex["robot_pose_y"]) for vertex in map_data["landmarks"]}
+
+            return map_landmarks
 
 class PoseModel(BaseModel):
     position: tuple

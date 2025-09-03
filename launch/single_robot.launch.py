@@ -21,6 +21,20 @@ def generate_launch_description():
         ]
     )
 
+    robot_ws_node = GroupAction(
+        actions=[
+            PushRosNamespace(namespace),
+            Node(
+                package='tb4_status',
+                executable='tb4_ws_node',
+                name='turtlebot_ws_node',
+                output='screen',
+                parameters=[{'robot_name': namespace}],
+            )
+        ]
+    )
+
     ld.add_action(robot_status_node)
+    ld.add_action(robot_ws_node)
 
     return ld

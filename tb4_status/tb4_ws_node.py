@@ -11,6 +11,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import BatteryState
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
+from tb4_status_interface.msg import StatusUpdate
 
 
 class TB4WsNode(Node):
@@ -22,10 +23,11 @@ class TB4WsNode(Node):
     """
     def __init__(self):
         super().__init__('tb4_ws_node')
+        self.loop = None
+
         self.ip_address = '10.100.111.90'
         self.uri = f"ws://10.100.111.76:5100/ws"
         self.websocket = None
-        self.loop = None
         self.status = 'ready'
         self.latest_odom_msg = None
 
@@ -58,6 +60,13 @@ class TB4WsNode(Node):
             qos_profile_sensor_data
         )
 
+        self.status_update_subscriber = self.create_subscription(
+            StatusUpdate,
+            'status_update',
+            self.status_update_callback,
+            10
+        )
+
     def battery_state_callback(self, msg: BatteryState):
         """
         Callback for battery state updates.
@@ -76,6 +85,18 @@ class TB4WsNode(Node):
         Callback for odometry updates.
         """
         self.latest_odom_msg = msg
+
+    def status_update_callback(self, msg: StatusUpdate):
+        """
+        Callback for status update messages.
+        """
+        status = msg.status
+        if status == 0:
+            self.status = 'idle'
+        elif status == 1:
+            self.status = 'executing'
+        elif status == 2:
+            self.status = 'charging'
 
     def calculate_speed(self):
         """
