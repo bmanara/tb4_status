@@ -6,7 +6,7 @@ from launch_ros.actions import Node, PushRosNamespace
 def generate_launch_description():
     ld = LaunchDescription()
 
-    namespace = 'tb11'
+    namespace = 'tb6'
 
     robot_status_node = GroupAction(
         actions=[

@@ -27,6 +27,7 @@ setup(
         'console_scripts': [
             'tb4_status_node = tb4_status.tb4_status_node:main',
             'tb4_api_node = tb4_status.tb4_api_node:main',
+            'tb4_ws_node = tb4_status.tb4_ws_node:main'
         ],
     },    
 )

@@ -16,37 +16,17 @@ import threading
 from fastapi import FastAPI
 import uvicorn
 from pydantic import BaseModel
+import time
 
 
 # Constants
+DEFAULT_INITIAL_POSE_POSITION = (-6.0, -1.0, 0.0)
+DEFAULT_INITIAL_POSE_ORIENTATION = (0.0, 0.0, 0.999596054053229, 0.028420568629322587)
+
 DEFAULT_INITIAL_POSE_COVARIANCE = [0.0] * 36
 DEFAULT_INITIAL_POSE_COVARIANCE[0] = 0.25
 DEFAULT_INITIAL_POSE_COVARIANCE[7] = 0.25
 DEFAULT_INITIAL_POSE_COVARIANCE[35] = 0.06853891945200942
-
-# DUMMY_POINTS = [
-#     (-12.0, -2.0, 0.0),
-#     (-11.0, -2.0, 0.0),
-#     (-10.0, -2.0, 0.0),
-#     (-9.0, -2.0, 0.0),
-#     (-8.0, -2.0, 0.0),
-#     (-7.0, -2.0, 0.0),
-#     (-6.0, -2.0, 0.0),
-#     (-12.0, -1.0, 0.0),
-#     (-11.0, -1.0, 0.0),
-#     (-10.0, -1.0, 0.0),
-#     (-9.0, -1.0, 0.0),
-#     (-8.0, -1.0, 0.0),
-#     (-7.0, -1.0, 0.0),
-#     (-6.0, -1.0, 0.0),
-#     (-12.0, 0.0, 0.0),
-#     (-11.0, 0.0, 0.0),
-#     (-10.0, 0.0, 0.0),
-#     (-9.0, 0.0, 0.0),
-#     (-8.0, 0.0, 0.0),
-#     (-7.0, 0.0, 0.0),
-#     (-6.0, 0.0, 0.0),
-# ]
 
 
 class TB4ApiNode(Node):
@@ -76,25 +56,11 @@ class TB4ApiNode(Node):
             10
         )
 
-        self.current_battery_state = None
-        self.battery_state_subscriber = self.create_subscription(
-            BatteryState,
-            'battery_state',
-            self.battery_state_callback,
-            qos_profile_sensor_data
-        )
-
         self._navigate_to_pose_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._navigate_through_poses_client = ActionClient(self, NavigateThroughPoses, 'navigate_through_poses')
 
         self.map_landmarks = self.__read_map_from_json()
         self.get_logger().info(f"Map landmarks loaded: {self.map_landmarks}")
-
-    def battery_state_callback(self, msg: BatteryState):
-        """
-        Callback for battery state updates.
-        """
-        self.current_battery_state = msg
 
     def send_dock_goal(self):
         """
@@ -186,6 +152,15 @@ class TB4ApiNode(Node):
 
         pose_msg.pose.covariance = DEFAULT_INITIAL_POSE_COVARIANCE
 
+        self.get_logger().info("Waiting for AMCL subscriber...")
+        while self.initial_pose_publisher.get_subscription_count() == 0:
+            if not rclpy.ok():
+                return
+            
+            self.get_logger().info("Waiting for AMCL subscriber...")
+            time.sleep(2.0)
+        
+        self.get_logger().info(f"Publishing initial pose: {pose_msg} to AMCL")
         self.initial_pose_publisher.publish(pose_msg)
 
         return True
@@ -249,6 +224,16 @@ class TB4ApiNode(Node):
 
     def send_trajectory(self, trajectory: list):
         trajectory_msg = self.__create_trajectory_message(trajectory)
+        self._navigate_through_poses_client.wait_for_server()
+        self.get_logger().info("Sending trajectory command to TurtleBot 4...")
+
+        # TODO: Probably best NOT to update status of turtlebot here...
+        status_msg = StatusUpdate()
+        status_msg.status = 1
+        self.status_update_publisher.publish(status_msg)
+
+        future = self._navigate_through_poses_client.send_goal_async(trajectory_msg)
+        future.add_done_callback(self.__trajectory_response_callback)
 
     def __trajectory_response_callback(self, future):
         """
@@ -279,17 +264,8 @@ class TB4ApiNode(Node):
         poses = [self.__create_pose_message(traj) for traj in trajectory]
         trajectory_msg = NavigateThroughPoses.Goal()
         trajectory_msg.poses = poses
-        
-        self._navigate_through_poses_client.wait_for_server()
-        self.get_logger().info("Sending trajectory command to TurtleBot 4...")
 
-        # TODO: Probably best NOT to update status of turtlebot here...
-        status_msg = StatusUpdate()
-        status_msg.status = 1
-        self.status_update_publisher.publish(status_msg)
-
-        future = self._navigate_through_poses_client.send_goal_async(trajectory_msg)
-        future.add_done_callback(self.__trajectory_response_callback)
+        return trajectory_msg
 
     def __trajectory_response_callback(self, future):
         """
@@ -321,8 +297,8 @@ class TB4ApiNode(Node):
         pose_msg = PoseStamped()
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.header.frame_id = 'map'
-        pose_msg.pose.position.x = point[0] - 3.9
-        pose_msg.pose.position.y = point[1] - 0.9
+        pose_msg.pose.position.x = point[0]
+        pose_msg.pose.position.y = point[1]
         pose_msg.pose.position.z = 0.0
         pose_msg.pose.orientation.x = 0.0
         pose_msg.pose.orientation.y = 0.0
@@ -357,17 +333,6 @@ class TrajectoryModel(BaseModel):
 app = FastAPI()
 
 # API Endpoints
-@app.get('/status')
-async def status():
-    """
-    Endpoint to get the status of the TurtleBot 4.
-    """
-    # Here you would typically gather status information from the robot
-    # For now, we will return a placeholder response
-    status = {}
-    status['battery_percentage'] = tb4_api_node.current_battery_state.percentage * 100 if tb4_api_node.current_battery_state else None
-    return {"status": status}
-
 @app.post('/dock')
 async def dock():
     success = tb4_api_node.send_dock_goal()
@@ -376,13 +341,6 @@ async def dock():
 @app.post('/undock')
 async def undock():
     success = tb4_api_node.send_undock_goal()
-    return {"success": success}
-
-@app.post('/initialize')
-async def initialize(pose_model: PoseModel):
-    position = pose_model.position
-    orientation = pose_model.orientation
-    success = tb4_api_node.set_initial_pose(position, orientation)
     return {"success": success}
 
 @app.post('/goal')
@@ -404,6 +362,7 @@ def main(args=None):
 
     global tb4_api_node
     tb4_api_node = TB4ApiNode()
+    tb4_api_node.set_initial_pose(DEFAULT_INITIAL_POSE_POSITION, DEFAULT_INITIAL_POSE_ORIENTATION)
 
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(tb4_api_node)
