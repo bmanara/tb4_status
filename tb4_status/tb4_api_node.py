@@ -11,6 +11,8 @@ from tb4_status_interface.msg import StatusUpdate
 from nav2_msgs.action import NavigateToPose, NavigateThroughPoses
 from irobot_create_msgs.action import Dock, Undock
 
+from nav2_msgs.srv import ManageLifecycleNodes
+
 import json
 import threading
 from fastapi import FastAPI
@@ -35,8 +37,8 @@ class TB4ApiNode(Node):
     This node provides a REST API to control the TurtleBot 4 robot.
     Provided Functionality:
     - Docking and undocking the robot
-    - Getting robot status (battery state, TODO: other states)
-    - Receiving and translating trajectory commands (TODO)
+    - Receiving and translating trajectory commands
+    - Sending status updates to websocket node regarding current status
     """
     def __init__(self):
         super().__init__('tb4_api_node')
@@ -61,6 +63,16 @@ class TB4ApiNode(Node):
 
         self.map_landmarks = self.__read_map_from_json()
         self.get_logger().info(f"Map landmarks loaded: {self.map_landmarks}")
+
+        self.nav2_client = self.create_client(
+            ManageLifecycleNodes,
+            'lifecycle_manager_navigation/manage_nodes'
+        )
+
+        while not self.nav2_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().info('Nav2 lifecycle service not available, waiting...')
+
+        self.get_logger().info('Nav2 lifecycle service is available.')
 
     def send_dock_goal(self):
         """
@@ -167,7 +179,7 @@ class TB4ApiNode(Node):
 
     def send_goal(self, position: tuple, orientation: tuple):
         """
-        Handles translation and sending a goal command to the TurtleBot 4.
+        Handles translation and sending a goal command to the TurtleBot 4. Deprecated, use send_trajectory instead.
         """
         if position is None or len(position) != 2:
             self.get_logger().error("Invalid position provided. Must be a tuple of (x, y).")
@@ -201,7 +213,7 @@ class TB4ApiNode(Node):
 
     def __goal_response_callback(self, future):
         """
-        Private callback for the goal response.
+        Private callback for the goal response. Deprecated, use send_goal's callback instead.
         """
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -214,7 +226,7 @@ class TB4ApiNode(Node):
 
     def __goal_result_callback(self, future):
         """
-        Private callback for the goal result.
+        Private callback for the goal result. Deprecated, use send_trajectory's callback instead.
         """
         result = future.result().result
         if result is None:
@@ -227,11 +239,6 @@ class TB4ApiNode(Node):
         self._navigate_through_poses_client.wait_for_server()
         self.get_logger().info("Sending trajectory command to TurtleBot 4...")
 
-        # TODO: Probably best NOT to update status of turtlebot here...
-        status_msg = StatusUpdate()
-        status_msg.status = 1
-        self.status_update_publisher.publish(status_msg)
-
         future = self._navigate_through_poses_client.send_goal_async(trajectory_msg)
         future.add_done_callback(self.__trajectory_response_callback)
 
@@ -243,6 +250,11 @@ class TB4ApiNode(Node):
         if not goal_handle.accepted:
             self.get_logger().error("Trajectory was rejected.")
             return
+
+        # Update status to 'executing' when trajectory is accepted
+        status_msg = StatusUpdate()
+        status_msg.status = 1
+        self.status_update_publisher.publish(status_msg)
 
         self.get_logger().info("Trajectory accepted, waiting for result...")
         result_future = goal_handle.get_result_async()
@@ -258,6 +270,11 @@ class TB4ApiNode(Node):
         else:
             self.get_logger().info(f"Trajectory action completed with result: {result}")
 
+        # Update status to 'idle' when trajectory is completed (or failed)
+        status_msg = StatusUpdate()
+        status_msg.status = 0
+        self.status_update_publisher.publish(status_msg)
+
     def __create_trajectory_message(self, trajectory: list):
         # For now, send a dummy trajectory message
         # TODO: This should be replaced with actual trajectory message creation logic
@@ -266,29 +283,6 @@ class TB4ApiNode(Node):
         trajectory_msg.poses = poses
 
         return trajectory_msg
-
-    def __trajectory_response_callback(self, future):
-        """
-        Private callback for the trajectory response.
-        """
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error("Trajectory was rejected.")
-            return
-
-        self.get_logger().info("Trajectory accepted, waiting for result...")
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self.__trajectory_result_callback)
-
-    def __goal_result_callback(self, future):
-        """
-        Private callback for the trajectory result.
-        """
-        result = future.result().result
-        if result is None:
-            self.get_logger().error("Trajectory action failed.")
-        else:
-            self.get_logger().info(f"Trajectory action completed with result: {result}")
 
     def __create_pose_message(self, p: int):
         point = self.map_landmarks[p]
@@ -318,6 +312,32 @@ class TB4ApiNode(Node):
             map_landmarks = {vertex["user_uid"]: (vertex["robot_pose_x"], vertex["robot_pose_y"]) for vertex in map_data["landmarks"]}
 
             return map_landmarks
+
+    def send_pause(self):
+        """
+        Send a request to Nav2 lifecycle to deactivate the navigation stack.
+        """
+        pause_request = ManageLifecycleNodes.Request()
+        pause_request.command = ManageLifecycleNodes.Request.PAUSE
+
+        status_msg = StatusUpdate()
+        status_msg.status = 0  # Set status to 'idle' when pausing
+        self.status_update_publisher.publish(status_msg)
+
+        return self.nav2_client.call_async(pause_request)
+
+    def send_resume(self):
+        """
+        Send a request to Nav2 lifecycle to activate the navigation stack.
+        """
+        resume_request = ManageLifecycleNodes.Request()
+        resume_request.command = ManageLifecycleNodes.Request.RESUME
+
+        status_msg = StatusUpdate()
+        status_msg.status = 1  # Set status to 'executing' when resuming
+        self.status_update_publisher.publish(status_msg)
+
+        return self.nav2_client.call_async(resume_request)
 
 class PoseModel(BaseModel):
     position: tuple
@@ -355,6 +375,16 @@ async def trajectory(trajectory_model: TrajectoryModel):
     trajectory = trajectory_model.trajectory
     tb4_api_node.send_trajectory(trajectory)
     return {"message": "Trajectory command received", "trajectory": trajectory_model}
+
+@app.post('/pause')
+async def pause():
+    tb4_api_node.send_pause()
+    return {"message": "Pause command received", "task_id": "12345"}
+
+@app.post('/resume')
+async def resume():
+    tb4_api_node.send_resume()
+    return {"message": "Resume command received"}
 
 
 def main(args=None):
