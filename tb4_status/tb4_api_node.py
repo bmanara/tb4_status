@@ -43,6 +43,9 @@ class TB4ApiNode(Node):
     def __init__(self):
         super().__init__('tb4_api_node')
         self.map_landmarks = None
+        self.trajectory = None
+        self.latest_trajectory_feedback_msg = None
+
         self._dock_client = ActionClient(self, Dock, 'dock')
         self._undock_client = ActionClient(self, Undock, 'undock')
 
@@ -239,8 +242,16 @@ class TB4ApiNode(Node):
         self._navigate_through_poses_client.wait_for_server()
         self.get_logger().info("Sending trajectory command to TurtleBot 4...")
 
-        future = self._navigate_through_poses_client.send_goal_async(trajectory_msg)
+        future = self._navigate_through_poses_client.send_goal_async(trajectory_msg, self.__trajectory_feedback_callback)
         future.add_done_callback(self.__trajectory_response_callback)
+
+    def __trajectory_feedback_callback(self, feedback_msg):
+        """
+        Private callback for the trajectory feedback.
+        Update self.trajectory to reflect remaining waypoints.
+        """
+        feedback = feedback_msg.feedback
+        self.latest_trajectory_feedback_msg = feedback
 
     def __trajectory_response_callback(self, future):
         """
@@ -276,8 +287,7 @@ class TB4ApiNode(Node):
         self.status_update_publisher.publish(status_msg)
 
     def __create_trajectory_message(self, trajectory: list):
-        # For now, send a dummy trajectory message
-        # TODO: This should be replaced with actual trajectory message creation logic
+        self.trajectory = trajectory
         poses = [self.__create_pose_message(traj) for traj in trajectory]
         trajectory_msg = NavigateThroughPoses.Goal()
         trajectory_msg.poses = poses
@@ -316,6 +326,7 @@ class TB4ApiNode(Node):
     def send_pause(self):
         """
         Send a request to Nav2 lifecycle to deactivate the navigation stack.
+        Saves the remaining trajectory if there is one.
         """
         pause_request = ManageLifecycleNodes.Request()
         pause_request.command = ManageLifecycleNodes.Request.PAUSE
@@ -324,20 +335,38 @@ class TB4ApiNode(Node):
         status_msg.status = 0  # Set status to 'idle' when pausing
         self.status_update_publisher.publish(status_msg)
 
+        # Update self.trajectory to only include remaining waypoints
+        if self.latest_trajectory_feedback_msg:
+            remaining_points = self.latest_trajectory_feedback_msg.number_of_poses_remaining
+            if len(self.trajectory) > remaining_points:
+                self.trajectory = self.trajectory[-remaining_points:]
+            elif len(self.trajectory) == None:
+                self.trajectory = None
+
         return self.nav2_client.call_async(pause_request)
 
     def send_resume(self):
         """
         Send a request to Nav2 lifecycle to activate the navigation stack.
+        Will send the remaining trajectory if there was one before pausing.
         """
         resume_request = ManageLifecycleNodes.Request()
         resume_request.command = ManageLifecycleNodes.Request.RESUME
+
+        self.nav2_client.call_async(resume_request)
+        if self.trajectory:
+            # If there was a trajectory before pausing, resend it once action server is available
+            while not self._navigate_through_poses_client.wait_for_server(timeout_sec=2.0):
+                self.get_logger().info('NavigateThroughPoses action server not available, waiting...')
+
+            time.sleep(5.0) # Give some extra time for the server to be fully ready
+            self.get_logger().info('NavigateThroughPoses action server is available, resending trajectory...')
+            self.send_trajectory(self.trajectory)
 
         status_msg = StatusUpdate()
         status_msg.status = 1  # Set status to 'executing' when resuming
         self.status_update_publisher.publish(status_msg)
 
-        return self.nav2_client.call_async(resume_request)
 
 class PoseModel(BaseModel):
     position: tuple
@@ -379,7 +408,7 @@ async def trajectory(trajectory_model: TrajectoryModel):
 @app.post('/pause')
 async def pause():
     tb4_api_node.send_pause()
-    return {"message": "Pause command received", "task_id": "12345"}
+    return {"message": "Pause command received", "task_id": "12345"} # dummy task_id
 
 @app.post('/resume')
 async def resume():
