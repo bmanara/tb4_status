@@ -147,7 +147,7 @@ class TB4WsNode(Node):
             }
 
             self.schedule_websocket_message(data)
-            await asyncio.sleep(5)  # Send update every 5 seconds
+            await asyncio.sleep(1)  # Send update every 1 second
 
     def schedule_websocket_message(self, data):
         if self.loop and not self.loop.is_closed():
