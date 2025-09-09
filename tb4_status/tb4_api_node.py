@@ -16,6 +16,7 @@ from nav2_msgs.srv import ManageLifecycleNodes
 import json
 import threading
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 import uvicorn
 from pydantic import BaseModel
 import time
@@ -72,7 +73,7 @@ class TB4ApiNode(Node):
             'lifecycle_manager_navigation/manage_nodes'
         )
 
-        while not self.nav2_client.wait_for_service(timeout_sec=2.0):
+        while not self.nav2_client.wait_for_service(timeout_sec=5.0):
             self.get_logger().info('Nav2 lifecycle service not available, waiting...')
 
         self.get_logger().info('Nav2 lifecycle service is available.')
@@ -173,7 +174,7 @@ class TB4ApiNode(Node):
                 return
             
             self.get_logger().info("Waiting for AMCL subscriber...")
-            time.sleep(2.0)
+            time.sleep(5.0)
         
         self.get_logger().info(f"Publishing initial pose: {pose_msg} to AMCL")
         self.initial_pose_publisher.publish(pose_msg)
@@ -262,10 +263,7 @@ class TB4ApiNode(Node):
             self.get_logger().error("Trajectory was rejected.")
             return
 
-        # Update status to 'executing' when trajectory is accepted
-        status_msg = StatusUpdate()
-        status_msg.status = 1
-        self.status_update_publisher.publish(status_msg)
+        self.__update_status(1)  # set to executing when trajectory is accepted
 
         self.get_logger().info("Trajectory accepted, waiting for result...")
         result_future = goal_handle.get_result_async()
@@ -276,15 +274,21 @@ class TB4ApiNode(Node):
         Private callback for the trajectory result.
         """
         result = future.result().result
+
+        # Possible status codes:
+        # 4 = SUCCEEDED (completed successfully)
+        # 5 = ABORTED (user cancelled)
+        # 6 = CANCELLED (lifecycle pause sends cancel request)
+        status = future.result().status
         if result is None:
             self.get_logger().error("Trajectory action failed.")
         else:
             self.get_logger().info(f"Trajectory action completed with result: {result}")
+            self.get_logger().info(f"Trajectory action completed with status: {status}")
 
-        # Update status to 'idle' when trajectory is completed (or failed)
-        status_msg = StatusUpdate()
-        status_msg.status = 0
-        self.status_update_publisher.publish(status_msg)
+        # Differentiate between SUCCEEDED, ABORTED, and CANCELLED for status update
+        if status == 4:
+            self.__update_status(0)  # set to idle when only when trajectory is completed (or failed)
 
     def __create_trajectory_message(self, trajectory: list):
         self.trajectory = trajectory
@@ -331,10 +335,6 @@ class TB4ApiNode(Node):
         pause_request = ManageLifecycleNodes.Request()
         pause_request.command = ManageLifecycleNodes.Request.PAUSE
 
-        status_msg = StatusUpdate()
-        status_msg.status = 0  # Set status to 'idle' when pausing
-        self.status_update_publisher.publish(status_msg)
-
         # Update self.trajectory to only include remaining waypoints
         if self.latest_trajectory_feedback_msg:
             remaining_points = self.latest_trajectory_feedback_msg.number_of_poses_remaining
@@ -356,17 +356,41 @@ class TB4ApiNode(Node):
         self.nav2_client.call_async(resume_request)
         if self.trajectory:
             # If there was a trajectory before pausing, resend it once action server is available
-            while not self._navigate_through_poses_client.wait_for_server(timeout_sec=2.0):
+            while not self._navigate_through_poses_client.wait_for_server(timeout_sec=5.0):
                 self.get_logger().info('NavigateThroughPoses action server not available, waiting...')
 
             time.sleep(5.0) # Give some extra time for the server to be fully ready
             self.get_logger().info('NavigateThroughPoses action server is available, resending trajectory...')
             self.send_trajectory(self.trajectory)
 
-        status_msg = StatusUpdate()
-        status_msg.status = 1  # Set status to 'executing' when resuming
-        self.status_update_publisher.publish(status_msg)
+    def send_abort(self):
+        """
+        Send a request to Nav2 lifecycle to deactivate the navigation stack.
+        Clears any saved trajectory and set robot status to idle.
+        """
+        pause_request = ManageLifecycleNodes.Request()
+        pause_request.command = ManageLifecycleNodes.Request.PAUSE
 
+        self.nav2_client.call_async(pause_request)
+
+        self.trajectory = None
+        time.sleep(2)
+
+        self.send_resume() 
+        self.__update_status(0)  # set to idle when aborting task
+
+    def __update_status(self, status: int):
+        """
+        Update the robot status and publish it.
+        Status codes:
+        0 - idle
+        1 - executing
+        2 - paused
+        3 - error
+        """
+        status_msg = StatusUpdate()
+        status_msg.status = status
+        self.status_update_publisher.publish(status_msg)
 
 class PoseModel(BaseModel):
     position: tuple
@@ -414,6 +438,11 @@ async def pause():
 async def resume():
     tb4_api_node.send_resume()
     return {"message": "Resume command received"}
+
+@app.post('/abort')
+async def abort():
+    tb4_api_node.send_abort()
+    return {"message": "Abort command received", "task_id": "12345"} # dummy task_id
 
 
 def main(args=None):
