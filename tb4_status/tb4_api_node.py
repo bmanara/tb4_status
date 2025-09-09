@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from pydantic import BaseModel
 import time
+from typing import Optional
 
 
 # Constants
@@ -46,6 +47,7 @@ class TB4ApiNode(Node):
         self.map_landmarks = None
         self.trajectory = None
         self.latest_trajectory_feedback_msg = None
+        self.current_task_id = None
 
         self._dock_client = ActionClient(self, Dock, 'dock')
         self._undock_client = ActionClient(self, Undock, 'undock')
@@ -238,13 +240,20 @@ class TB4ApiNode(Node):
         else:
             self.get_logger().info(f"Goal action completed with result: {result}")
 
-    def send_trajectory(self, trajectory: list):
+    def send_trajectory(self, trajectory: list, task_id: int):
+        previous_traj = self.trajectory
         trajectory_msg = self.__create_trajectory_message(trajectory)
-        self._navigate_through_poses_client.wait_for_server()
-        self.get_logger().info("Sending trajectory command to TurtleBot 4...")
 
+        if previous_traj:
+            # TODO: If there is a better way to deal with this logic, please update.
+            self.__temporary_abort() # If new trajectory comes in, best to abort previous Nav task before sending new one
+            time.sleep(5)
+
+        self._navigate_through_poses_client.wait_for_server()
         future = self._navigate_through_poses_client.send_goal_async(trajectory_msg, self.__trajectory_feedback_callback)
         future.add_done_callback(self.__trajectory_response_callback)
+
+        self.current_task_id = task_id
 
     def __trajectory_feedback_callback(self, feedback_msg):
         """
@@ -263,7 +272,7 @@ class TB4ApiNode(Node):
             self.get_logger().error("Trajectory was rejected.")
             return
 
-        self.__update_status(1)  # set to executing when trajectory is accepted
+        self.__update_status(1, self.current_task_id)  # set to executing when trajectory is accepted
 
         self.get_logger().info("Trajectory accepted, waiting for result...")
         result_future = goal_handle.get_result_async()
@@ -288,7 +297,8 @@ class TB4ApiNode(Node):
 
         # Differentiate between SUCCEEDED, ABORTED, and CANCELLED for status update
         if status == 4:
-            self.__update_status(0)  # set to idle when only when trajectory is completed (or failed)
+            self.__update_status(0, None)  # set to idle when only when trajectory is completed (or failed)
+            self.trajectory = None
 
     def __create_trajectory_message(self, trajectory: list):
         self.trajectory = trajectory
@@ -361,7 +371,7 @@ class TB4ApiNode(Node):
 
             time.sleep(5.0) # Give some extra time for the server to be fully ready
             self.get_logger().info('NavigateThroughPoses action server is available, resending trajectory...')
-            self.send_trajectory(self.trajectory)
+            self.send_trajectory(self.trajectory, self.current_task_id)
 
     def send_abort(self):
         """
@@ -377,9 +387,21 @@ class TB4ApiNode(Node):
         time.sleep(2)
 
         self.send_resume() 
-        self.__update_status(0)  # set to idle when aborting task
+        self.__update_status(0, None)  # set to idle when aborting task
 
-    def __update_status(self, status: int):
+    def __temporary_abort(self):
+        """
+        Private method to abort previous Nav task when new trajectory is given while running
+        """
+        pause_request = ManageLifecycleNodes.Request()
+        pause_request.command = ManageLifecycleNodes.Request.PAUSE
+        self.nav2_client.call_async(pause_request)
+
+        resume_request = ManageLifecycleNodes.Request()
+        resume_request.command = ManageLifecycleNodes.Request.RESUME
+        self.nav2_client.call_async(resume_request)
+
+    def __update_status(self, status: int, task_id: Optional[int]):
         """
         Update the robot status and publish it.
         Status codes:
@@ -387,10 +409,14 @@ class TB4ApiNode(Node):
         1 - executing
         2 - paused
         3 - error
+        task_id can be None if no task is being executed
         """
         status_msg = StatusUpdate()
         status_msg.status = status
+        status_msg.task_id = task_id if task_id else -1
         self.status_update_publisher.publish(status_msg)
+
+        self.current_task_id = task_id
 
 class PoseModel(BaseModel):
     position: tuple
@@ -402,6 +428,7 @@ class GoalModel(BaseModel):
 
 class TrajectoryModel(BaseModel):
     trajectory: list
+    task_id: int
 
 app = FastAPI()
 
@@ -426,13 +453,15 @@ async def goal(goal_model: GoalModel):
 @app.post('/trajectory')
 async def trajectory(trajectory_model: TrajectoryModel):
     trajectory = trajectory_model.trajectory
-    tb4_api_node.send_trajectory(trajectory)
+    task_id = trajectory_model.task_id
+    tb4_api_node.send_trajectory(trajectory, task_id)
     return {"message": "Trajectory command received", "trajectory": trajectory_model}
 
 @app.post('/pause')
 async def pause():
+    paused_task_id = tb4_api_node.current_task_id
     tb4_api_node.send_pause()
-    return {"message": "Pause command received", "task_id": "12345"} # dummy task_id
+    return {"message": "Pause command received", "task_id": paused_task_id}
 
 @app.post('/resume')
 async def resume():
@@ -441,8 +470,9 @@ async def resume():
 
 @app.post('/abort')
 async def abort():
+    aborted_task_id = tb4_api_node.current_task_id
     tb4_api_node.send_abort()
-    return {"message": "Abort command received", "task_id": "12345"} # dummy task_id
+    return {"message": "Abort command received", "task_id": aborted_task_id}
 
 
 def main(args=None):

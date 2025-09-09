@@ -35,6 +35,7 @@ class TB4WsNode(Node):
         self.battery_percent = None
         self.current_location_x = 0.0
         self.current_location_y = 0.0
+        self.current_task_id = None
 
         self.map_name = 'level5_arena_v3'
 
@@ -97,6 +98,9 @@ class TB4WsNode(Node):
             self.status = 'executing'
         elif status == 2:
             self.status = 'charging'
+        
+        task_id = msg.task_id
+        self.current_task_id = task_id if task_id != -1 else None
 
     def calculate_speed(self):
         """
@@ -130,7 +134,7 @@ class TB4WsNode(Node):
                 'ip_address': self.ip_address,
                 'location': current_location,
                 'status': self.status,
-                'task_id': 0,
+                'task_id': self.current_task_id,
                 'timestamp': self.get_clock().now().to_msg().sec,
                 'waypoints': None,
                 'curr_speed': curr_speed,
