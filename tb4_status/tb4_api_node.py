@@ -21,6 +21,7 @@ import uvicorn
 from pydantic import BaseModel
 import time
 from typing import Optional
+import random
 
 
 # Constants
@@ -240,7 +241,7 @@ class TB4ApiNode(Node):
         else:
             self.get_logger().info(f"Goal action completed with result: {result}")
 
-    def send_trajectory(self, trajectory: list, task_id: int):
+    def send_trajectory(self, trajectory: list):
         previous_traj = self.trajectory
         trajectory_msg = self.__create_trajectory_message(trajectory)
 
@@ -252,8 +253,6 @@ class TB4ApiNode(Node):
         self._navigate_through_poses_client.wait_for_server()
         future = self._navigate_through_poses_client.send_goal_async(trajectory_msg, self.__trajectory_feedback_callback)
         future.add_done_callback(self.__trajectory_response_callback)
-
-        self.current_task_id = task_id
 
     def __trajectory_feedback_callback(self, feedback_msg):
         """
@@ -272,7 +271,7 @@ class TB4ApiNode(Node):
             self.get_logger().error("Trajectory was rejected.")
             return
 
-        self.__update_status(1, self.current_task_id)  # set to executing when trajectory is accepted
+        self.__update_status(1, random.randint(1, 1000))  # set to executing when trajectory is accepted
 
         self.get_logger().info("Trajectory accepted, waiting for result...")
         result_future = goal_handle.get_result_async()
@@ -371,7 +370,7 @@ class TB4ApiNode(Node):
 
             time.sleep(5.0) # Give some extra time for the server to be fully ready
             self.get_logger().info('NavigateThroughPoses action server is available, resending trajectory...')
-            self.send_trajectory(self.trajectory, self.current_task_id)
+            self.send_trajectory(self.trajectory)
 
     def send_abort(self):
         """
@@ -409,7 +408,7 @@ class TB4ApiNode(Node):
         1 - executing
         2 - paused
         3 - error
-        task_id can be None if no task is being executed
+        task_id can be None if no task is being executed, however, -1 will be sent to ws_node instead of None (due to ROS2 msg typing).
         """
         status_msg = StatusUpdate()
         status_msg.status = status
@@ -428,7 +427,6 @@ class GoalModel(BaseModel):
 
 class TrajectoryModel(BaseModel):
     trajectory: list
-    task_id: int
 
 app = FastAPI()
 
@@ -453,8 +451,7 @@ async def goal(goal_model: GoalModel):
 @app.post('/trajectory')
 async def trajectory(trajectory_model: TrajectoryModel):
     trajectory = trajectory_model.trajectory
-    task_id = trajectory_model.task_id
-    tb4_api_node.send_trajectory(trajectory, task_id)
+    tb4_api_node.send_trajectory(trajectory)
     return {"message": "Trajectory command received", "trajectory": trajectory_model}
 
 @app.post('/pause')
