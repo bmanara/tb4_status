@@ -49,6 +49,7 @@ class TB4ApiNode(Node):
         self.trajectory = None
         self.latest_trajectory_feedback_msg = None
         self.current_task_id = None
+        self.request_id = None
 
         self._dock_client = ActionClient(self, Dock, 'dock')
         self._undock_client = ActionClient(self, Undock, 'undock')
@@ -241,11 +242,13 @@ class TB4ApiNode(Node):
         else:
             self.get_logger().info(f"Goal action completed with result: {result}")
 
-    def send_trajectory(self, trajectory: list):
+    def send_trajectory(self, trajectory: list, request_id: int):
+        self.request_id = request_id
+
         previous_traj = self.trajectory
         trajectory_msg = self.__create_trajectory_message(trajectory)
 
-        if previous_traj:
+        if previous_traj: # Deprecated due to shortest path implementation instead of mapf
             # TODO: If there is a better way to deal with this logic, please update.
             self.__temporary_abort() # If new trajectory comes in, best to abort previous Nav task before sending new one
             time.sleep(5)
@@ -257,7 +260,7 @@ class TB4ApiNode(Node):
     def __trajectory_feedback_callback(self, feedback_msg):
         """
         Private callback for the trajectory feedback.
-        Update self.trajectory to reflect remaining waypoints.
+        Used to update self.trajectory to reflect remaining waypoints.
         """
         feedback = feedback_msg.feedback
         self.latest_trajectory_feedback_msg = feedback
@@ -271,7 +274,7 @@ class TB4ApiNode(Node):
             self.get_logger().error("Trajectory was rejected.")
             return
 
-        self.__update_status(1, random.randint(1, 1000))  # set to executing when trajectory is accepted
+        self.__update_status(1, random.randint(1, 1000), 5)  # set to executing when trajectory is accepted
 
         self.get_logger().info("Trajectory accepted, waiting for result...")
         result_future = goal_handle.get_result_async()
@@ -296,8 +299,9 @@ class TB4ApiNode(Node):
 
         # Differentiate between SUCCEEDED, ABORTED, and CANCELLED for status update
         if status == 4:
-            self.__update_status(0, None)  # set to idle when only when trajectory is completed (or failed)
+            self.__update_status(0, None, 4)  # set to idle when only when trajectory is completed
             self.trajectory = None
+
 
     def __create_trajectory_message(self, trajectory: list):
         self.trajectory = trajectory
@@ -364,13 +368,15 @@ class TB4ApiNode(Node):
 
         self.nav2_client.call_async(resume_request)
         if self.trajectory:
+            previous_traj = self.trajectory
+            self.trajectory = None
             # If there was a trajectory before pausing, resend it once action server is available
             while not self._navigate_through_poses_client.wait_for_server(timeout_sec=5.0):
                 self.get_logger().info('NavigateThroughPoses action server not available, waiting...')
 
             time.sleep(5.0) # Give some extra time for the server to be fully ready
             self.get_logger().info('NavigateThroughPoses action server is available, resending trajectory...')
-            self.send_trajectory(self.trajectory)
+            self.send_trajectory(previous_traj, self.request_id)
 
     def send_abort(self):
         """
@@ -386,7 +392,7 @@ class TB4ApiNode(Node):
         time.sleep(2)
 
         self.send_resume() 
-        self.__update_status(0, None)  # set to idle when aborting task
+        self.__update_status(0, None, 6)  # set to idle when aborting task
 
     def __temporary_abort(self):
         """
@@ -400,19 +406,26 @@ class TB4ApiNode(Node):
         resume_request.command = ManageLifecycleNodes.Request.RESUME
         self.nav2_client.call_async(resume_request)
 
-    def __update_status(self, status: int, task_id: Optional[int]):
+    def __update_status(self, status: int, task_id: Optional[int], task_status: Optional[int]):
         """
         Update the robot status and publish it.
-        Status codes:
-        0 - idle
-        1 - executing
-        2 - paused
-        3 - error
+        Robot status codes:
+            0 - idle
+            1 - executing
+            2 - paused
+            3 - error
         task_id can be None if no task is being executed, however, -1 will be sent to ws_node instead of None (due to ROS2 msg typing).
+        Task status codes:
+            None - no tasks to report
+            4 - succeeded
+            5 - executing
+            6 - aborted
         """
         status_msg = StatusUpdate()
         status_msg.status = status
         status_msg.task_id = task_id if task_id else -1
+        status_msg.task_status = task_status if task_status else 0
+        status_msg.request_id = self.request_id
         self.status_update_publisher.publish(status_msg)
 
         self.current_task_id = task_id
@@ -427,6 +440,7 @@ class GoalModel(BaseModel):
 
 class TrajectoryModel(BaseModel):
     trajectory: list
+    request_id: int
 
 app = FastAPI()
 
@@ -451,7 +465,8 @@ async def goal(goal_model: GoalModel):
 @app.post('/trajectory')
 async def trajectory(trajectory_model: TrajectoryModel):
     trajectory = trajectory_model.trajectory
-    tb4_api_node.send_trajectory(trajectory)
+    request_id = trajectory_model.request_id
+    tb4_api_node.send_trajectory(trajectory, request_id)
     return {"message": "Trajectory command received", "trajectory": trajectory_model}
 
 @app.post('/pause')

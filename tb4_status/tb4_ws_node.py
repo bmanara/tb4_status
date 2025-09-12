@@ -25,6 +25,9 @@ class TB4WsNode(Node):
         super().__init__('tb4_ws_node')
         self.loop = None
 
+        self.request_id = 0 
+        self.task_status = 0
+
         self.ip_address = '10.100.111.90'
         self.uri = f"ws://10.100.111.76:5100/ws"
         self.websocket = None
@@ -101,6 +104,8 @@ class TB4WsNode(Node):
         
         task_id = msg.task_id
         self.current_task_id = task_id if task_id != -1 else None
+        self.request_id = msg.request_id
+        self.task_status = msg.task_status
 
     def calculate_speed(self):
         """
@@ -117,9 +122,9 @@ class TB4WsNode(Node):
 
         return linear_speed
 
-    async def status_update_loop(self):
+    async def robot_status_update_loop(self):
         """
-        Periodically send status updates to connected WebSocket clients.
+        Periodically send robot status updates to connected WebSocket clients.
         """
         while rclpy.ok():
             current_location = {
@@ -153,6 +158,47 @@ class TB4WsNode(Node):
             self.schedule_websocket_message(data)
             await asyncio.sleep(1)  # Send update every 1 second
 
+    async def task_status_update_loop(self):
+        """
+        Periodically send task status updates to connected WebSocket clients.
+        Provides mock data for demonstration purposes.
+        0. header->requestid
+        1. payload->data->robot_mission_data->mission_status->mission_id
+        2. payload->data->robot_mission_data->curr_sub_mission_status->mission_custom_data
+        3. payload->data->robot_mission_data->curr_sub_mission_status->tasks_summary (supposed to be a list of tasks, but...)
+        
+        """
+        while rclpy.ok():
+            payload = {
+                'auc_id': self.get_namespace().strip('/'),
+                "data": [
+                    {
+                        "robot_mission_data": {
+                            "curr_sub_mission_status": {
+                                "mission_custom_data": "[{\"data\":{\"request_str\":\"20250709_091704_24\",\"requestid\":" + str(self.request_id) + "},\"name\":\"i2rfm\"}]",
+                                "tasks_summary": "[{\"state\":" + str(self.task_status) + ",\"type\":-3,\"uid\":3}]"
+                            },
+                            "mission_status": {
+                                "mission_id": self.current_task_id if self.current_task_id is not None else -1
+                            }
+                        }
+                    }
+                ]
+            }
+
+            data = {
+                'header': {
+                    'status_id': 4,
+                    'type': 2,
+                    'requestid': self.request_id
+                },
+                'payload': payload
+            }
+
+            self.schedule_websocket_message(data)
+            await asyncio.sleep(1)  # Send update every 1 second
+
+
     def schedule_websocket_message(self, data):
         if self.loop and not self.loop.is_closed():
             asyncio.run_coroutine_threadsafe(self.send_websocket_message(data), self.loop)
@@ -169,7 +215,9 @@ class TB4WsNode(Node):
         self.loop = asyncio.get_event_loop()
 
         # Start the status update loop as a background task
-        status_task = asyncio.create_task(self.status_update_loop())
+        robot_status_loop = asyncio.create_task(self.robot_status_update_loop())
+
+        task_status_loop = asyncio.create_task(self.task_status_update_loop())
 
         while rclpy.ok():
             try:
@@ -197,7 +245,8 @@ class TB4WsNode(Node):
                 await asyncio.sleep(5)
         
         # Cancel the status task when exiting
-        status_task.cancel()
+        robot_status_loop.cancel()
+        task_status_loop.cancel()
 
     def ros_spin(self):
         rclpy.spin(self)
